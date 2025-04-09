@@ -6,6 +6,6 @@ gym
 matplotlib
 seaborn
 tqdm
-scikit-learn
+scikit - learn
 jupyterlab
 kaggle
