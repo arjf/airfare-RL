@@ -95,9 +95,16 @@ plt.ylabel('Count')
 plt.savefig('visualizations/price_bracket_distribution.png')
 plt.close()
 
-# Prepare features and targets
+# Check if 'price_bracket' exists in df_encoded
+if 'price_bracket' not in df_encoded.columns:
+    # Create it if it doesn't exist
+    df_encoded['price_bracket'] = pd.qcut(df_encoded['price'], q=10, labels=False)
+
 X = df_encoded.drop(['price', 'price_bracket', 'flight', 'source_city', 'destination_city', 'class'], axis=1)
+# Prepare features and targets
 y = df['price_bracket']  # Using price brackets as the target
+
+
 
 # Split data into training and testing sets
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
