@@ -13,81 +13,36 @@ from visualize import (
     plot_pricing_strategies,
     plot_performance_comparison,
 )
-
-
 def main():
-    # Create results directory
-    if not os.path.exists('results'):
-        os.makedirs('results')
+    # Load the Delhi-Mumbai flight dataset
+    flight_data = load_airline_dataset()
     
-    # Load data from Kaggle
-    print("Loading flight data from Kaggle...")
-    data = load_flight_data()
+    if flight_data is None:
+        print("Error: Could not load dataset. Exiting.")
+        return
     
-    # Display dataset information
-    print("\nDataset Information:")
-    print(f"Number of records: {len(data)}")
-    print(f"Columns: {data.columns.tolist()}")
-    print("\nSample data:")
-    print(data.head())
+    # Print dataset information
+    print(f"Loaded {len(flight_data)} flight records")
+    print(f"Price range: ₹{flight_data['price'].min()} to ₹{flight_data['price'].max()}")
+    print(f"Airlines: {flight_data['airline'].unique()}")
     
-    # Create environment
-    env = AirlinePricingEnv(data)
-    state_size = env.observation_space.shape[0]
-    action_size = env.action_space.shape[0]
-    max_action = float(env.action_space.high[0])
+    # Create environment with the real dataset
+    env = AirlinePricingEnv(flight_data)
     
     # Train SAC agent
     print("\nTraining SAC agent...")
-    sac_training_metrics = train_agent('SAC', data, episodes=500, save_dir='models')
+    sac_agent = SAC(env.observation_space.shape[0], env.action_space.shape[0], 
+                     float(env.action_space.high[0]))
+    sac_metrics = train_agent(sac_agent, env, episodes=500)
     
     # Train PPO agent
     print("\nTraining PPO agent...")
-    ppo_training_metrics = train_agent('PPO', data, episodes=500, save_dir='models')
+    ppo_agent = PPO(env.observation_space.shape[0], env.action_space.shape[0],
+                     float(env.action_space.high[0]))
+    ppo_metrics = train_agent(ppo_agent, env, episodes=500)
     
-    # Plot learning curves
-    plot_learning_curves(
-        sac_training_metrics,
-        ppo_training_metrics,
-        save_path="results/learning_curves.png",
-    )
-
-    # Plot training efficiency
-    plot_training_efficiency(
-        sac_training_metrics,
-        ppo_training_metrics,
-        save_path="results/training_efficiency.png",
-    )
-
-    # Create and load agents for evaluation
-    sac_agent = SAC(state_size, action_size, max_action)
-    sac_agent.load("models/SAC_agent_final")
-
-    ppo_agent = PPO(state_size, action_size, max_action)
-    ppo_agent.load("models/PPO_agent_final")
-
-    # Evaluate agents
-    print("\nEvaluating SAC agent...")
-    sac_eval_metrics = evaluate_agent("SAC", sac_agent, env, episodes=50)
-
-    print("\nEvaluating PPO agent...")
-    ppo_eval_metrics = evaluate_agent("PPO", ppo_agent, env, episodes=50)
-
-    # Compare algorithms
-    comparison_metrics = compare_algorithms(sac_eval_metrics, ppo_eval_metrics)
-
-    # Plot pricing strategies
-    plot_pricing_strategies(
-        sac_eval_metrics, ppo_eval_metrics, save_path="results/pricing_strategies.png"
-    )
-
-    # Plot performance comparison
-    plot_performance_comparison(
-        comparison_metrics, save_path="results/performance_comparison.png"
-    )
-
-    print("\nTraining and evaluation complete. Results saved to 'results' directory.")
-
+    # Compare performance
+    compare_agents(sac_metrics, ppo_metrics, env)
 
 def simulate_flight_data():
     """Generate simulated flight data for demonstration"""
@@ -104,96 +59,49 @@ def simulate_flight_data():
     }
 
     return pd.DataFrame(data)
-
-def load_flight_data():
-    """
-    Download and load airline pricing data from Kaggle
-    
-    Dataset: "Airline Pricing and Customer Response Dataset"
-    This dataset contains:
-    - Historical booking patterns
-    - Pricing information
-    - Competitor pricing
-    - Customer demand data
-    - Seasonal factors
-    """
-    import os
-    import kaggle
-    from kaggle.api.kaggle_api_extended import KaggleApi
+def load_airline_dataset():
+    """Load and preprocess the Delhi-Mumbai flight pricing dataset"""
     import pandas as pd
-    import zipfile
+    import os
     
-    # Set up the data directory
+    # Set up data directory
     data_dir = 'data'
     if not os.path.exists(data_dir):
         os.makedirs(data_dir)
     
-    dataset_path = os.path.join(data_dir, 'airline_pricing.csv')
+    dataset_path = os.path.join(data_dir, 'Clean_Dataset.csv')
     
-    # Check if dataset already exists locally
+    # Handle dataset availability
     if not os.path.exists(dataset_path):
-        print("Downloading dataset from Kaggle...")
-        
-        # Initialize Kaggle API
-        # Note: You need to have a kaggle.json file in ~/.kaggle/
-        try:
-            api = KaggleApi()
-            api.authenticate()
-            
-            # Download the dataset (replace with actual dataset name)
-            # Format: username/dataset-name
-            api.dataset_download_files(
-                'airlineindustry/airline-pricing-and-demand-dataset',
-                path=data_dir
-            )
-            
-            # Extract the downloaded zip file
-            zip_path = os.path.join(data_dir, 'airline-pricing-and-demand-dataset.zip')
-            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                zip_ref.extractall(data_dir)
-                
-            # Remove the zip file after extraction
-            os.remove(zip_path)
-            print("Dataset downloaded and extracted successfully!")
-            
-        except Exception as e:
-            print(f"Error downloading dataset: {e}")
-            print("Falling back to simulated data...")
-            return simulate_flight_data()
-    else:
-        print("Using existing dataset from local storage.")
+        # Copy from current directory if available
+        if os.path.exists('Clean_Dataset.csv'):
+            import shutil
+            shutil.copy('Clean_Dataset.csv', dataset_path)
+            print("Dataset copied to data directory")
+        else:
+            print("Dataset not found")
+            return None
     
     # Load and preprocess the dataset
-    try:
-        # Read the CSV file
-        df = pd.read_csv(dataset_path)
-        
-        # Perform necessary preprocessing
-        
-        # 1. Handle missing values
-        df.fillna({
-            'base_demand': df['base_demand'].mean(),
-            'base_price': df['base_price'].mean(),
-            'elasticity': df['elasticity'].mean(),
-            'capacity': df['capacity'].median()
-        }, inplace=True)
-        
-        # 2. Filter out outliers
-        df = df[(df['base_price'] > 0) & (df['base_price'] < 2000)]
-        df = df[(df['elasticity'] > 0.1) & (df['elasticity'] < 5.0)]
-        
-        # 3. Feature engineering - add any additional features needed
-        # Example: Calculate price per seat
-        if 'capacity' in df.columns:
-            df['price_per_seat'] = df['base_price'] / df['capacity']
-        
-        print(f"Successfully loaded dataset with {len(df)} records.")
-        return df
-        
-    except Exception as e:
-        print(f"Error loading or processing dataset: {e}")
-        print("Falling back to simulated data...")
-        return simulate_flight_data()
+    df = pd.read_csv(dataset_path)
+    
+    # Convert categorical variables to numeric for RL algorithms
+    time_categories = ['Early_Morning', 'Morning', 'Afternoon', 'Evening', 'Night', 'Late_Night']
+    time_map = {cat: i for i, cat in enumerate(time_categories)}
+    
+    df['departure_time_num'] = df['departure_time'].map(time_map)
+    df['arrival_time_num'] = df['arrival_time'].map(time_map)
+    
+    # Map stop categories
+    df['stops_num'] = df['stops'].map({'zero': 0, 'one': 1, 'two_or_more': 2})
+    
+    # Encode airlines
+    df['airline_code'] = pd.factorize(df['airline'])[0]
+    
+    # Convert duration to float if needed
+    df['duration'] = df['duration'].astype(float)
+    
+    return df
 
 
 def simulate_flight_data():
