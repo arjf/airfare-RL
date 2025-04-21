@@ -21,10 +21,10 @@ import sbx
 from sbx import PPO, TD3, SAC
 from scipy.special import expit
 
-# Set JAX to use 64-bit precision for more stable training
+# Set JAX to use 64-bit precision
 jax.config.update("jax_enable_x64", True)
 
-# Check if GPU is available and set JAX to use it
+# GPU check
 print(f"JAX devices: {jax.devices()}")
 if any(dev.platform == 'gpu' for dev in jax.devices()):
     print("Using GPU acceleration")
@@ -68,7 +68,6 @@ for col in df.columns:
     print(col, df[col].dtype)
     
 # %%
-# JAX optimized functions for environment computation
 @partial(jax.jit, static_argnums=(0,))
 def compute_purchase_prob(beta, gamma, state, price):
     """JAX accelerated purchase probability computation"""
@@ -82,7 +81,7 @@ def compute_reward(beta, gamma, state, price):
     return price * prob, prob
 
 # %%
-# Function to create environment instances for vectorized environments
+# Create environment instances for vectorized environments
 def make_env_fn(env_class, **kwargs):
     """Function to create a single environment instance"""
     def _init():
@@ -101,7 +100,7 @@ def make_vec_env(env_class, n_envs=1, env_kwargs=None, use_async=False):
         return SyncVectorEnv(env_fns)   # Sequential execution in a single process
 
 # %%
-# Create optimized Airfare Environment Class that works with Gymnasium
+# Create Airfare Environment Class
 class AirfarePricingEnv(gym.Env):
     metadata = {"render_modes": ["human"], "render_fps": 30}
     
@@ -147,14 +146,13 @@ class AirfarePricingEnv(gym.Env):
         # Get current state
         X = self.features[self.current_idx]
         
-        # Use JAX-accelerated functions for computation
         reward, prob_purchase = compute_reward(self.beta, self.gamma, X, price)
         
-        # Convert from JAX arrays to numpy for compatibility
+        # Convert to NP
         reward = float(reward)
         prob_purchase = float(prob_purchase)
         
-        # Store for metrics
+        # Storess
         self.prices.append(price)
         self.purchase_probs.append(prob_purchase)
         self.episode_reward += reward
@@ -232,22 +230,12 @@ class Metrics:
         np.save(f'{self.metrics_dir}/purchase_probs.npy', np.array(self.purchase_probs))
         np.save(f'{self.metrics_dir}/episode_returns.npy', np.array(self.episode_returns))
         
-        # 1. Plot reward metrics
+        # Create and save plots
         self._plot_rewards(plots_dir)
-        
-        # 2. Plot price distribution
         self._plot_price_distribution(plots_dir)
-        
-        # 3. Plot purchase probability distribution
         self._plot_purchase_distribution(plots_dir)
-        
-        # 4. Plot price vs reward relationship
         self._plot_price_reward_relationship(plots_dir)
-        
-        # 5. Create a business metrics summary
         self._create_business_metrics_summary(plots_dir)
-        
-        # 6. Create combined dashboard
         self._create_dashboard(plots_dir)
     
     def _plot_rewards(self, plots_dir):
@@ -429,7 +417,7 @@ class Metrics:
         plt.close()
 
 # %%
-# Early stopping callback with JAX-accelerated computations
+# Early stopping callback
 class EarlyStoppingCallback:
     def __init__(self, patience=5, min_delta=0.1):
         self.patience = patience
@@ -447,7 +435,7 @@ class EarlyStoppingCallback:
             
             # Only check after a certain number of episodes
             if len(self.rewards_history) % 10 == 0:
-                # Calculate average of last 10 rewards (using JAX for speed)
+                # Calculate average of last 10 rewards
                 avg_reward = jnp.mean(jnp.array(self.rewards_history[-10:]))
                 
                 # Check for improvement
@@ -466,7 +454,7 @@ class EarlyStoppingCallback:
         return True  # Continue training
 
 # %%
-# Create optimized training function
+# Create training function
 def train_and_evaluate(model_class, model_name, env_class, env_kwargs, n_envs=4, total_timesteps=100_000):
     print(f"Training {model_name}...")
     
@@ -485,7 +473,7 @@ def train_and_evaluate(model_class, model_name, env_class, env_kwargs, n_envs=4,
     
     print(f"Using {n_envs_to_use} parallel environments for {model_name}")
     
-    # Create a properly vectorized environment
+    # Create a vectorized environment
     if n_envs_to_use > 1:
         vec_env = make_vec_env(env_class, n_envs=n_envs_to_use, env_kwargs=env_kwargs, use_async=use_async)
         env = vec_env
@@ -621,7 +609,7 @@ def main():
     # Detect number of CPU cores for parallelization
     import multiprocessing
     n_cpu = multiprocessing.cpu_count()
-    optimal_envs = max(1, min(16, n_cpu - 1))  # Leave 1 CPU for system
+    optimal_envs = max(1, min(16, n_cpu - 1)) 
     print(f"Using {optimal_envs} environments for parallel training (detected {n_cpu} CPUs)")
     
     # Train and evaluate each model

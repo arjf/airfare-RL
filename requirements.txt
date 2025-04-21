@@ -1,32 +1,21 @@
-# Core ML packages
 numpy>=1.23.0
 pandas>=1.5.0
 matplotlib>=3.5.0
 scikit-learn>=1.2.0
-scipy>=1.10.0
+scipy
 
-# JAX with GPU support
 --find-links https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
-jax[cuda12]>=0.4.13  # For CUDA 12.x, change to cuda11 for CUDA 11.x
+jax[cuda12]
+gymnasium
+sbx
 
-# Gymnasium (modern Gym)
-gymnasium>=0.28.1
-shimmy>=0.2.1  # For compatibility layers
-
-# SBX (Stable Baselines X)
-sbx>=1.0.0
-torch>=2.0.0  # Required by sbx
+torch>=2.0.0
 torchvision>=0.15.0
 torchaudio>=2.0.0
+nvidia-cudnn-cu12>=8.9.0
+nvidia-cublas-cu12>=12.1.0
+nvidia-cufft-cu12>=11.0.0
 
-# Additional dependencies for GPU acceleration
-nvidia-cudnn-cu12>=8.9.0  # CUDA Deep Neural Network library
-nvidia-cublas-cu12>=12.1.0  # CUDA BLAS library
-nvidia-cufft-cu12>=11.0.0  # CUDA FFT library
-
-# Visualization and utilities
 seaborn>=0.12.0
 tqdm>=4.64.0
-
-# Optional: for distributed training
-ray>=2.5.0 
+ray>=2.5.0
