@@ -11,11 +11,25 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import MinMaxScaler
-import gym
-from gym import spaces
+import gymnasium as gym
+from gymnasium import spaces
+from gymnasium.vector import SyncVectorEnv, AsyncVectorEnv
+import jax
+import jax.numpy as jnp
+from functools import partial
 import sbx
 from sbx import PPO, TD3, SAC
 from scipy.special import expit
+
+# Set JAX to use 64-bit precision for more stable training
+jax.config.update("jax_enable_x64", True)
+
+# Check if GPU is available and set JAX to use it
+print(f"JAX devices: {jax.devices()}")
+if any(dev.platform == 'gpu' for dev in jax.devices()):
+    print("Using GPU acceleration")
+else:
+    print("No GPU found, using CPU")
 
 # %%
 # Data Preprocessing
@@ -54,18 +68,128 @@ for col in df.columns:
     print(col, df[col].dtype)
     
 # %%
-# Create helper function for vectorized environments
-def make_vec_env(env_class, n_envs=1, env_kwargs=None):
-    """
-    Create a vectorized environment manually
-    """
-    env_kwargs = {} if env_kwargs is None else env_kwargs
-    envs = [env_class(**env_kwargs) for _ in range(n_envs)]
-    
+# JAX optimized functions for environment computation
+@partial(jax.jit, static_argnums=(0,))
+def compute_purchase_prob(beta, gamma, state, price):
+    """JAX accelerated purchase probability computation"""
+    logit = jnp.dot(beta, state) + gamma * price
+    return jax.nn.sigmoid(logit)
+
+@partial(jax.jit, static_argnums=(1,))
+def compute_reward(beta, gamma, state, price):
+    """JAX accelerated reward computation"""
+    prob = compute_purchase_prob(beta, gamma, state, price)
+    return price * prob, prob
+
+# %%
+# Function to create environment instances for vectorized environments
+def make_env_fn(env_class, **kwargs):
+    """Function to create a single environment instance"""
     def _init():
-        return envs
+        return env_class(**kwargs)
+    return _init
+
+# Create vectorized environment using Gymnasium's built-in vector environments
+def make_vec_env(env_class, n_envs=1, env_kwargs=None, use_async=False):
+    """Create a properly vectorized environment using Gymnasium's vector API"""
+    env_kwargs = {} if env_kwargs is None else env_kwargs
+    env_fns = [make_env_fn(env_class, **env_kwargs) for _ in range(n_envs)]
+    
+    if use_async and n_envs > 1:
+        return AsyncVectorEnv(env_fns)  # Parallel execution across processes
+    else:
+        return SyncVectorEnv(env_fns)   # Sequential execution in a single process
+
+# %%
+# Create optimized Airfare Environment Class that works with Gymnasium
+class AirfarePricingEnv(gym.Env):
+    metadata = {"render_modes": ["human"], "render_fps": 30}
+    
+    def __init__(self, data, min_price, max_price, render_mode=None):
+        super().__init__()
+        # Pre-process data for faster access
+        self.data = data.reset_index(drop=True)
+        self.features = self.data.iloc[:, :-1].values.astype(np.float32)
+        self.data_length = len(self.data)
+        self.render_mode = render_mode
         
-    return _init()
+        self.current_idx = 0
+        self.min_price = min_price
+        self.max_price = max_price
+        self.action_space = spaces.Box(low=0, high=1, shape=(1,), dtype=np.float32)  # normalized price
+        self.observation_space = spaces.Box(
+            low=0, high=1, shape=(self.features.shape[1],), dtype=np.float32
+        )
+        
+        # Initialize demand model parameters (now as numpy arrays for JAX)
+        self.beta = np.random.uniform(-1, 1, size=self.features.shape[1])
+        self.gamma = -2.0  # price sensitivity
+        self.episode_reward = 0
+        self.prices = []
+        self.purchase_probs = []
+        
+    def reset(self, *, seed=None, options=None):
+        # Gymnasium reset requires seed parameter and returns (obs, info)
+        super().reset(seed=seed)
+        
+        self.current_idx = 0
+        self.episode_reward = 0
+        self.prices = []
+        self.purchase_probs = []
+        
+        # Return observation and info dict
+        return self.features[self.current_idx].copy(), {}
+
+    def step(self, action):
+        # Convert normalized price to actual price
+        price = float(action[0]) * (self.max_price - self.min_price) + self.min_price
+        
+        # Get current state
+        X = self.features[self.current_idx]
+        
+        # Use JAX-accelerated functions for computation
+        reward, prob_purchase = compute_reward(self.beta, self.gamma, X, price)
+        
+        # Convert from JAX arrays to numpy for compatibility
+        reward = float(reward)
+        prob_purchase = float(prob_purchase)
+        
+        # Store for metrics
+        self.prices.append(price)
+        self.purchase_probs.append(prob_purchase)
+        self.episode_reward += reward
+        
+        # Update state
+        self.current_idx += 1
+        terminated = self.current_idx >= self.data_length
+        truncated = False  # We don't truncate episodes early
+        
+        # Create info dict
+        info = {
+            'price': price,
+            'purchase_prob': prob_purchase,
+            'episode_reward': self.episode_reward if terminated else None
+        }
+        
+        # Get next state
+        if not terminated:
+            next_state = self.features[self.current_idx].copy()
+        else:
+            next_state = np.zeros_like(X, dtype=np.float32)
+        
+        # Gymnasium step returns (obs, reward, terminated, truncated, info)
+        return next_state, reward, terminated, truncated, info
+    
+    def render(self):
+        if self.render_mode == "human":
+            # Simple text rendering of current state
+            if self.current_idx > 0:
+                price = self.prices[-1]
+                prob = self.purchase_probs[-1]
+                print(f"Step {self.current_idx}: Price ${price:.2f}, Purchase prob: {prob:.4f}")
+        
+    def close(self):
+        pass
 
 # %%
 # Create Metrics Class
@@ -305,69 +429,12 @@ class Metrics:
         plt.close()
 
 # %%
-# Create Airfare Environment Class
-class AirfarePricingEnv(gym.Env):
-    def __init__(self, data, min_price, max_price):
-        super().__init__()
-        self.data = data.reset_index(drop=True)
-        self.current_idx = 0
-        self.min_price = min_price
-        self.max_price = max_price
-        self.action_space = spaces.Box(low=0, high=1, shape=(1,), dtype=np.float32)  # normalized price
-        self.observation_space = spaces.Box(
-            low=0, high=1, shape=(data.shape[1] - 1,), dtype=np.float32
-        )
-        # Example coefficients for the demand model (customize as needed)
-        self.beta = np.random.uniform(-1, 1, size=(data.shape[1] - 1))
-        self.gamma = -2.0  # price sensitivity
-        self.episode_reward = 0
-        self.prices = []
-        self.purchase_probs = []
-
-    def reset(self):
-        self.current_idx = 0
-        self.episode_reward = 0
-        self.prices = []
-        self.purchase_probs = []
-        return self.data.iloc[self.current_idx, :-1].values.astype(np.float32)
-
-    def step(self, action):
-        price = float(action[0]) * (self.max_price - self.min_price) + self.min_price
-        X = self.data.iloc[self.current_idx, :-1].values
-
-        # Simulate purchase probability (logistic demand model)
-        prob_purchase = expit(np.dot(self.beta, X) + self.gamma * price)
-        reward = price * prob_purchase
-        
-        # Store for metrics
-        self.prices.append(price)
-        self.purchase_probs.append(prob_purchase)
-        self.episode_reward += reward
-        
-        self.current_idx += 1
-        done = self.current_idx >= len(self.data)
-        
-        info = {
-            'price': price,
-            'purchase_prob': prob_purchase,
-            'episode_reward': self.episode_reward if done else None
-        }
-        
-        next_state = (
-            self.data.iloc[self.current_idx, :-1].values.astype(np.float32)
-            if not done
-            else np.zeros_like(X, dtype=np.float32)
-        )
-        
-        return next_state, reward, done, info
-
-# %%
-# Early stopping callback
+# Early stopping callback with JAX-accelerated computations
 class EarlyStoppingCallback:
     def __init__(self, patience=5, min_delta=0.1):
         self.patience = patience
         self.min_delta = min_delta
-        self.best_reward = -np.inf
+        self.best_reward = -float('inf')
         self.counter = 0
         self.should_stop = False
         self.rewards_history = []
@@ -380,12 +447,12 @@ class EarlyStoppingCallback:
             
             # Only check after a certain number of episodes
             if len(self.rewards_history) % 10 == 0:
-                # Calculate average of last 10 rewards
-                avg_reward = np.mean(self.rewards_history[-10:])
+                # Calculate average of last 10 rewards (using JAX for speed)
+                avg_reward = jnp.mean(jnp.array(self.rewards_history[-10:]))
                 
                 # Check for improvement
                 if avg_reward > self.best_reward + self.min_delta:
-                    self.best_reward = avg_reward
+                    self.best_reward = float(avg_reward)
                     self.counter = 0
                 else:
                     self.counter += 1
@@ -399,59 +466,96 @@ class EarlyStoppingCallback:
         return True  # Continue training
 
 # %%
-# Create training function
+# Create optimized training function
 def train_and_evaluate(model_class, model_name, env_class, env_kwargs, n_envs=4, total_timesteps=100_000):
     print(f"Training {model_name}...")
     
     # Create early stopping callback
     early_stopping = EarlyStoppingCallback(patience=10, min_delta=0.05)
     
-    # Create vectorized environment for training
-    # PPO benefits most from vectorization
+    # Determine number of environments based on algorithm
     if model_name == 'ppo':
+        # PPO benefits from more parallelization
         n_envs_to_use = n_envs
+        use_async = True  # Use async for PPO (more efficient for on-policy)
     else:
-        # Off-policy algorithms like TD3 and SAC can work well with fewer envs
-        n_envs_to_use = 1
+        # Off-policy algorithms don't need as many parallel envs
+        n_envs_to_use = max(1, n_envs // 2)
+        use_async = False  # No need for async for off-policy algorithms
     
-    # Create the environment (use vectorized for PPO, single for others)
+    print(f"Using {n_envs_to_use} parallel environments for {model_name}")
+    
+    # Create a properly vectorized environment
     if n_envs_to_use > 1:
-        # Create multiple environments
-        envs = make_vec_env(env_class, n_envs=n_envs_to_use, env_kwargs=env_kwargs)
-        env = envs[0]  # For PPO, use the first env as the main one
+        vec_env = make_vec_env(env_class, n_envs=n_envs_to_use, env_kwargs=env_kwargs, use_async=use_async)
+        env = vec_env
     else:
+        # Just use a single environment if only one is needed
         env = env_class(**env_kwargs)
     
-    # Different parameters for different algorithms
-    if model_name == 'ppo':
-        model = model_class(
-            'MlpPolicy', 
-            env, 
-            verbose=1,
-            n_steps=512,
-            batch_size=64,
-            n_epochs=10
-        )
-    elif model_name == 'td3':
-        model = model_class(
-            'MlpPolicy', 
-            env, 
-            verbose=1,
-            buffer_size=10000,
-            learning_starts=1000,
-            train_freq=1,
-            gradient_steps=1
-        )
-    elif model_name == 'sac':
-        model = model_class(
-            'MlpPolicy', 
-            env, 
-            verbose=1,
-            buffer_size=10000,
-            learning_starts=1000,
-            train_freq=1,
-            gradient_steps=1
-        )
+    # Configure models with optimized parameters for each algorithm
+    try:
+        if model_name == 'ppo':
+            model = model_class(
+                'MlpPolicy', 
+                env, 
+                verbose=1,
+                n_steps=512,
+                batch_size=64,
+                n_epochs=10,
+                learning_rate=3e-4,
+                ent_coef=0.01,  # Encourage exploration
+                use_sde=True,   # Stochastic exploration
+                sde_sample_freq=4
+            )
+        elif model_name == 'td3':
+            model = model_class(
+                'MlpPolicy', 
+                env, 
+                verbose=1,
+                buffer_size=100000,
+                learning_starts=1000,
+                train_freq=1,
+                gradient_steps=1,
+                learning_rate=3e-4,
+                policy_delay=2,
+                batch_size=256
+            )
+        elif model_name == 'sac':
+            model = model_class(
+                'MlpPolicy', 
+                env, 
+                verbose=1,
+                buffer_size=100000,
+                learning_starts=1000,
+                train_freq=1,
+                gradient_steps=1,
+                learning_rate=3e-4,
+                batch_size=256,
+                ent_coef='auto'  # Automatic entropy tuning
+            )
+    except ValueError as e:
+        print(f"Error creating {model_name} model: {e}")
+        try:
+            # Fallback to a single environment if vectorized environment causes issues
+            print("Falling back to single environment")
+            if isinstance(env, (SyncVectorEnv, AsyncVectorEnv)):
+                env.close()
+            env = env_class(**env_kwargs)
+            if model_name == 'ppo':
+                model = model_class('MlpPolicy', env, verbose=1)
+            elif model_name == 'td3':
+                model = model_class('MlpPolicy', env, verbose=1)
+            elif model_name == 'sac':
+                model = model_class('MlpPolicy', env, verbose=1)
+        except Exception as e2:
+            print(f"Fallback also failed: {e2}")
+            raise
+    
+    # Enable SBX's JIT compilation if available
+    if hasattr(model, 'policy') and hasattr(model.policy, 'set_jit'):
+        print(f"Enabling JIT compilation for {model_name}")
+        model.policy.set_jit(True)
     
     # Train with early stopping
     model.learn(
@@ -460,6 +564,7 @@ def train_and_evaluate(model_class, model_name, env_class, env_kwargs, n_envs=4,
         callback=early_stopping
     )
     
+    # Save model
     model.save(f'models/{model_name}_airfare')
     
     print(f"Evaluating {model_name}...")
@@ -467,13 +572,17 @@ def train_and_evaluate(model_class, model_name, env_class, env_kwargs, n_envs=4,
     
     # Create a single environment for evaluation
     eval_env = env_class(**env_kwargs)
-    obs = eval_env.reset()
+    obs, _ = eval_env.reset()  # Gymnasium reset returns (obs, info)
+    terminated = truncated = False
     done = False
     total_reward = 0
     
+    # Fast evaluation loop
     while not done:
         action, _ = model.predict(obs, deterministic=True)
-        obs, reward, done, info = eval_env.step(action)
+        # Gymnasium step returns (obs, reward, terminated, truncated, info)
+        obs, reward, terminated, truncated, info = eval_env.step(action)
+        done = terminated or truncated
         total_reward += reward
         
         # Log detailed metrics
@@ -487,7 +596,10 @@ def train_and_evaluate(model_class, model_name, env_class, env_kwargs, n_envs=4,
         if done and 'episode_reward' in info:
             metrics.log_episode(info['episode_reward'])
     
-    # Clean up (no need for vec_env.close() now)
+    # Clean up
+    if isinstance(env, (SyncVectorEnv, AsyncVectorEnv)):
+        env.close()
+    eval_env.close()
     
     print(f"{model_name} total evaluation reward: {total_reward}")
     metrics.save_and_plot()
@@ -495,42 +607,59 @@ def train_and_evaluate(model_class, model_name, env_class, env_kwargs, n_envs=4,
     return metrics
 
 # %%
-# Execute
-os.makedirs('models', exist_ok=True)
+# Execute with optimized settings
+def main():
+    os.makedirs('models', exist_ok=True)
+    
+    # Prepare environment arguments
+    env_kwargs = {
+        'data': df,
+        'min_price': min_price,
+        'max_price': max_price
+    }
+    
+    # Detect number of CPU cores for parallelization
+    import multiprocessing
+    n_cpu = multiprocessing.cpu_count()
+    optimal_envs = max(1, min(16, n_cpu - 1))  # Leave 1 CPU for system
+    print(f"Using {optimal_envs} environments for parallel training (detected {n_cpu} CPUs)")
+    
+    # Train and evaluate each model
+    model_classes = {'ppo': PPO, 'td3': TD3, 'sac': SAC}
+    all_metrics = {}
+    
+    for name, cls in model_classes.items():
+        try:
+            metrics = train_and_evaluate(
+                cls, 
+                name, 
+                AirfarePricingEnv, 
+                env_kwargs,
+                n_envs=optimal_envs
+            )
+            all_metrics[name] = metrics
+        except Exception as e:
+            print(f"Error training {name}: {e}")
+            continue
+    
+    # Plot comparison of all successful models
+    if all_metrics:
+        plt.figure(figsize=(10, 6))
+        for name, metrics in all_metrics.items():
+            rewards = np.array(metrics.rewards)
+            window = min(100, len(rewards))
+            if window > 0:
+                moving_avg = np.convolve(rewards, np.ones(window) / window, mode='valid')
+                plt.plot(moving_avg, label=name.upper())
+        plt.title('Moving Average Reward Comparison')
+        plt.xlabel('Episode')
+        plt.ylabel('Reward')
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig('metrics/reward_comparison.png')
+        plt.close()
+    
+    print("All done! Metrics and models saved.")
 
-# Prepare environment arguments
-env_kwargs = {
-    'data': df,
-    'min_price': min_price,
-    'max_price': max_price
-}
-
-# Train and evaluate each model
-model_classes = {'ppo': PPO, 'td3': TD3, 'sac': SAC}
-all_metrics = {}
-
-for name, cls in model_classes.items():
-    metrics = train_and_evaluate(
-        cls, 
-        name, 
-        AirfarePricingEnv, 
-        env_kwargs,
-        n_envs=8 if name == 'ppo' else 1  # PPO benefits more from parallelization
-    )
-    all_metrics[name] = metrics
-
-# Optionally, plot all moving averages for comparison
-plt.figure(figsize=(10, 6))
-for name, metrics in all_metrics.items():
-    rewards = np.array(metrics.rewards)
-    window = min(100, len(rewards))
-    moving_avg = np.convolve(rewards, np.ones(window) / window, mode='valid')
-    plt.plot(moving_avg, label=name.upper())
-plt.title('Moving Average Reward Comparison')
-plt.xlabel('Episode')
-plt.ylabel('Reward')
-plt.legend()
-plt.tight_layout()
-plt.savefig('metrics/reward_comparison.png')
-plt.close()
-print("All done! Metrics and models saved.")
+if __name__ == "__main__":
+    main()
